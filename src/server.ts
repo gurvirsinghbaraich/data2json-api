@@ -105,12 +105,12 @@ app.post("/v1", async function (ctx) {
               )}\n\n-----------\nValid JSON output in expected format:`;
 
               const openaiResponse = await openai.chat.completions.create({
-                model: "gpt-4o",
+                model: "gpt-3.5-turbo",
                 messages: [
                   {
                     role: "assistant",
                     content:
-                      "You are an AI that converts data into the attached JSON format. You respond with nothing but valid JSON based on the input data. Your output should DIRECTLY be a valid JSON, nothing added before and after. You will begin with the opening curly brace and end with the closing curly brace. Each property in 'Expected JSON format' specified is an object containing the data type of it. Only if you absolutely cannot determine a field, use the value null. You are also responsible for calling special functions. Each special function can be understood as mutation on the data for the following field. Each mutation is starts with '<' and ends with '>'. The mutation can be be natural language used to describe the action that needs to be done on the data.",
+                      "You are an AI that converts data into JSON format based on the given template. Respond with nothing but valid JSON directly, starting with { and ending with }. If a field cannot be determined, use null.",
                   },
                   { role: "user", content: EXAMPLE_PROMPT },
                   { role: "user", content: EXAMPLE_ANSWER },
