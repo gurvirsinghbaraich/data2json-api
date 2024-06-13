@@ -1,4 +1,5 @@
 import { serve } from "@hono/node-server";
+import { GPTTokens } from "gpt-tokens";
 import { Hono } from "hono";
 import {
   ValiError,
@@ -76,6 +77,11 @@ app.post("/v1", async function (ctx) {
     );
 
     const supabase = createSupabaseClient();
+    const payloadSchema = object({
+      input: string(),
+      format: looseObject({}),
+    });
+
     try {
       const { data: apiKeyRecord } = await supabase
         .from("keys")
@@ -83,91 +89,133 @@ app.post("/v1", async function (ctx) {
         .eq("key", apiToken)
         .single();
 
-      const payloadSchema = object({
-        input: string(),
-        format: looseObject({}),
-      });
+      if (!apiKeyRecord) {
+        return ctx.json(
+          { error: "Unauthorized: Invalid API Key", data: null },
+          401
+        );
+      }
+
+      const creditsAvailable = await supabase
+        .from("tokens")
+        .select()
+        .eq("user_id", apiKeyRecord!.user_id)
+        .single();
+
+      if (!creditsAvailable.data) {
+        return ctx.json(
+          {
+            error:
+              "Unauthorized: Please completed the subscription process in the dashboard (https://www.data2json.xyz/dashboard)",
+            data: null,
+          },
+          401
+        );
+      }
 
       try {
-        try {
-          const { input, format } = parse(payloadSchema, await ctx.req.json());
+        let tokensUsed = 0;
+        const { input, format } = parse(payloadSchema, await ctx.req.json());
 
-          let tokensUsed = 0;
-          const dynamicSchema = generateDynamicSchema(format);
-
-          const response = await RetryablePromise.retry(
-            1,
-            async (resolve, reject): Promise<any> => {
-              const content = `DATA: \n"${input}"\n\n-----------\nExpected JSON format:\n${JSON.stringify(
+        const completionConfig = {
+          model: "gpt-4o",
+          messages: [
+            {
+              role: "assistant",
+              content:
+                "You are an AI that converts data into JSON format based on the given template. Respond with nothing but valid JSON directly, starting with { and ending with }. If a field cannot be determined, use null.",
+            },
+            { role: "user", content: EXAMPLE_PROMPT },
+            { role: "user", content: EXAMPLE_ANSWER },
+            {
+              role: "user",
+              content: `DATA: \n"${input}"\n\n-----------\nExpected JSON format:\n${JSON.stringify(
                 format,
                 null,
                 2
-              )}\n\n-----------\nValid JSON output in expected format:`;
+              )}\n\n-----------\nValid JSON output in expected format:`,
+            },
+          ],
+        };
 
-              const openaiResponse = await openai.chat.completions.create({
-                model: "gpt-3.5-turbo",
-                messages: [
-                  {
-                    role: "assistant",
-                    content:
-                      "You are an AI that converts data into JSON format based on the given template. Respond with nothing but valid JSON directly, starting with { and ending with }. If a field cannot be determined, use null.",
-                  },
-                  { role: "user", content: EXAMPLE_PROMPT },
-                  { role: "user", content: EXAMPLE_ANSWER },
-                  { role: "user", content },
-                ],
-              });
+        // @ts-ignore
+        const usageEstimate = new GPTTokens(completionConfig);
+        console.log(creditsAvailable.data.credits, usageEstimate.usedTokens);
 
-              const answer = openaiResponse.choices[0].message.content;
-              if (openaiResponse.usage?.total_tokens) {
-                tokensUsed += openaiResponse.usage.total_tokens;
-              }
-
-              try {
-                const jsonAnswer = JSON.parse(answer!);
-                resolve(parse(dynamicSchema, jsonAnswer));
-              } catch (error) {
-                reject(error);
-              }
-            }
+        if (!(+creditsAvailable.data.credits > usageEstimate.usedTokens)) {
+          return ctx.json(
+            {
+              error: "Unauthorized: Not enough credits available.",
+              data: null,
+            },
+            401
           );
+        }
 
-          await supabase.from("tokens_used").insert({
-            used: tokensUsed,
-            user_id: apiKeyRecord!.user_id,
-          });
+        const dynamicSchema = generateDynamicSchema(format);
 
-          return ctx.json({
-            error: null,
-            data: response,
-            tokensUsed: tokensUsed,
-          });
-        } catch (error) {}
-      } catch (error) {
-        const issues: Record<string, string> = {};
-
-        (error as ValiError<typeof payloadSchema>).issues.map((issue) => {
-          // @ts-ignore
-          if (issue.path?.[0]?.key) {
+        const response = await RetryablePromise.retry(
+          1,
+          async (resolve, reject): Promise<any> => {
             // @ts-ignore
-            issues[issue.path[0].key] = issue.message;
-          }
-        });
+            const openaiResponse = await openai.chat.completions.create({
+              ...completionConfig,
+            });
 
-        return ctx.json(
-          {
-            error: issues,
-            data: null,
-          },
-          {
-            status: 400,
+            const answer = openaiResponse.choices[0].message.content;
+            if (openaiResponse.usage?.total_tokens) {
+              tokensUsed += openaiResponse.usage.total_tokens;
+            }
+
+            try {
+              const jsonAnswer = JSON.parse(answer!);
+              resolve(parse(dynamicSchema, jsonAnswer));
+            } catch (error) {
+              reject(error);
+            }
           }
         );
-      }
+
+        await Promise.all([
+          supabase.from("tokens_used").insert({
+            used: tokensUsed,
+            user_id: apiKeyRecord!.user_id,
+          }),
+          supabase
+            .from("tokens")
+            .update({
+              credits: (
+                +creditsAvailable.data!.credits - tokensUsed
+              ).toString(),
+            })
+            .eq("user_id", apiKeyRecord!.user_id),
+        ]);
+
+        return ctx.json({
+          error: null,
+          data: response,
+          tokensUsed: tokensUsed,
+        });
+      } catch (error) {}
     } catch (error) {
+      const issues: Record<string, string> = {};
+
+      (error as ValiError<typeof payloadSchema>).issues.map((issue) => {
+        // @ts-ignore
+        if (issue.path?.[0]?.key) {
+          // @ts-ignore
+          issues[issue.path[0].key] = issue.message;
+        }
+      });
+
       return ctx.json(
-        { error: "Unauthorized: Invalid API Key", data: null },
-        401
+        {
+          error: issues,
+          data: null,
+        },
+        {
+          status: 400,
+        }
       );
     }
   } catch (error) {
